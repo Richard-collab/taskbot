@@ -8,7 +8,10 @@ JSON data files; action operations call the Baize outbound platform API.
 
 import json
 import os
+import re
+import uuid
 import httpx
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -934,3 +937,479 @@ async def set_line_ratio(
         return f"设置集线比失败：{result.get('msg', '未知错误')}"
     except Exception as exc:
         return f"设置集线比时发生错误：{exc}"
+
+
+# ---------------------------------------------------------------------------
+# InstructionEngine skill — parse natural language query to instructionBeanList
+# (replaces HTTP data lookups with local JSON file reads)
+# ---------------------------------------------------------------------------
+
+# ---- Intent detection rules (mirrors Java intent_rules.json patterns) ----
+
+_INTENT_RULES: list = [
+    # (intent_name, score, regex_pattern_list)
+    # Higher score takes priority in ambiguous matches.
+    # NOTE: Python re does NOT support variable-length lookbehinds;
+    # only fixed-length lookbehinds (e.g. (?<!X) where X is exactly 1 char)
+    # are used here.  Lookaheads may be variable-length.
+    ("START_TASK", 100, [r"操作(类型)?[：:]开[始起启]任务"]),
+    ("START_TASK", 100, [r"用.{1,5}[0-9一二两三四五六七八九十百千万]?(并发|线路|仙人|得心|白泽|限时)下发"]),
+    ("START_TASK", 1, [
+        r"开[测冲]", r"首轮呼", r"呼掉", r"全开", r"开始赚钱吧",
+        r"数据已推", r"已上传.{0,10}(?:线路|并发|下发)",
+        r"呼叫(?!成功|失败)",
+        r"开始(?:测试|启动|外呼|呼叫|任务)(?!了?[吗么])",
+        r"(?<!放)开启?任务|启动任务",
+        r"开始?呼(?!了?[吗么])",
+        r"[小大]并发呼",
+        r"(?:已推|已传|已上传).{0,20}(?:线路|并发|下发)",
+        r"(?:并发|开始)下发(?!的)",
+        r"[开走用呼跑](?:白泽|baize|仙人|xianren|得心|德心|dexin|限时|xianshi)",
+    ]),
+    ("STOP_TASK", 100, [r"操作(类型)?[：:](暂停|停止)任务"]),
+    ("STOP_TASK", 1, [
+        r"暂停(?!了?的)", r"停止(?!了?的)", r"停一?下", r"停呼",
+    ]),
+    ("RESUME_TASK", 100, [r"操作(类型)?[：:]恢复任务"]),
+    ("RESUME_TASK", 1, [r"恢复(?:运行|外呼)?", r"继续(?:外呼|下发|呼)"]),
+    ("CHANGE_CONCURRENCY", 100, [r"操作(类型)?[：:]调整并发"]),
+    ("CHANGE_CONCURRENCY", 1, [
+        r"(?:调整|加到|降到|开到)并发|并发(?:调整|[加降升提减]到)",
+    ]),
+    ("CHANGE_LINE", 100, [r"操作(类型)?[：:]切换线路"]),
+    ("CHANGE_LINE", 2, [
+        r"[切换](?:[至到为成]|一?下).{2,5}线路",
+        r"改[至到为成用呼].{2,5}线路",
+        r"[切换改](?:[至到为成]|一?下)(?:白泽|baize|仙人|xianren|得心|德心|dexin|限时|xianshi)",
+    ]),
+    ("FORBID_DISTRICT", 100, [r"操作(类型)?[：:](设置|地区)屏蔽"]),
+    ("FORBID_DISTRICT", 1, [
+        r"盲区",
+        # Lookaheads (not lookbehinds) are variable-length safe in Python re
+        r"屏蔽(?!.{0,10}(?:放|重)开)",
+    ]),
+    ("ALLOW_DISTRICT", 100, [r"操作(类型)?[：:]放开屏蔽"]),
+    ("ALLOW_DISTRICT", 2, [
+        r"(?:放开|重开|取消|解除).{0,10}屏蔽",
+        r"(?:盲区|屏蔽).{0,3}(?:帮忙|麻烦|再|重新)?.{0,5}(?:[放重]开|重新再?开)",
+    ]),
+]
+
+
+def _ie_detect_intents(text: str) -> list:
+    """Return list of detected intent names, sorted by score (highest first)."""
+    matched: dict = {}
+    for intent, score, patterns in _INTENT_RULES:
+        for pat in patterns:
+            try:
+                if re.search(pat, text):
+                    if matched.get(intent, 0) < score:
+                        matched[intent] = score
+                    break
+            except re.error:
+                pass  # skip malformed patterns defensively
+    return sorted(matched.keys(), key=lambda k: -matched[k])
+
+
+# ---- Slot extraction helpers ----
+
+def _ie_extract_account(text: str) -> Optional[str]:
+    """Extract explicitly stated account name from text."""
+    m = re.search(r'(?:主?账号|账户)[：:\s]*([A-Za-z0-9][A-Za-z0-9_]*)', text)
+    return m.group(1) if m else None
+
+
+def _ie_normalize_concurrency(val_str: str, unit_str: str) -> Optional[str]:
+    """Normalize a concurrency value + unit to an integer string."""
+    try:
+        val = float(val_str)
+        if unit_str in ('k', 'K', '千'):
+            val = val * 1000
+        elif unit_str == '万':
+            val = val * 10000
+        return str(int(val))
+    except (ValueError, TypeError):
+        return None
+
+
+def _ie_extract_concurrency(text: str) -> Optional[str]:
+    """Extract concurrency number from text. Avoids matching '呼通X' contexts."""
+    patterns = [
+        # "1k并发", "1000k并发"
+        (r'(\d+(?:\.\d+)?)\s*([kK千])\s*并发', 1, 2),
+        # "1万并发"
+        (r'(\d+(?:\.\d+)?)\s*(万)\s*并发', 1, 2),
+        # "并发开500", "并发加到1000"
+        (r'并发[开到加降升调改设]\s*(\d+(?:\.\d+)?)\s*([kK千万]?)', 1, 2),
+        # "500并发" — exclude '呼通' / '接通' prefixes (fixed-length lookbehinds)
+        (r'(?<!呼通)(?<!接通)(?<!\d)(\d{2,5})\s*([kK千]?)\s*并发(?!率)', 1, 2),
+        # "并发500"
+        (r'并发\s*(\d+)\s*([kK千万]?)', 1, 2),
+    ]
+    for pat, val_grp, unit_grp in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            val_str = m.group(val_grp)
+            unit_str = m.group(unit_grp) if unit_grp else ''
+            result = _ie_normalize_concurrency(val_str, unit_str or '')
+            if result:
+                return result
+    return None
+
+
+def _ie_extract_expected_end_time(text: str) -> Optional[str]:
+    """Extract expected-end-time from '11:00前呼完' style expressions."""
+    m = re.search(
+        r'(\d{1,2})[:.：](\d{2})(?:之?前)(?:呼完|结束|完成|停|搞定|弄完|跑完|完)?',
+        text,
+    )
+    if m:
+        h, mi = int(m.group(1)), int(m.group(2))
+        today = datetime.now().strftime("%Y-%m-%d")
+        return f"{today} {h:02d}:{mi:02d}:00"
+    return None
+
+
+def _ie_extract_expected_start_time(text: str) -> Optional[str]:
+    """Extract expected-start-time from '10:00开始' style expressions."""
+    m = re.search(r'(\d{1,2})[:.：](\d{2})(?:开始|之?后|起|再?呼)', text)
+    if m:
+        h, mi = int(m.group(1)), int(m.group(2))
+        today = datetime.now().strftime("%Y-%m-%d")
+        return f"{today} {h:02d}:{mi:02d}:00"
+    return None
+
+
+def _ie_extract_connected_count(text: str) -> Optional[str]:
+    """Extract expected connected-call count from '呼通5000暂停' style expressions."""
+    m = re.search(r'呼通\s*(\d+(?:\.\d+)?)\s*([kK千万])?.{0,5}暂停', text)
+    if m:
+        return _ie_normalize_concurrency(m.group(1), m.group(2) or '')
+    return None
+
+
+def _ie_extract_task_name_filters(text: str) -> dict:
+    """Extract task-name filter conditions (contain / not-contain / equal / suffix)."""
+    result: dict = {"contain": [], "not_contain": [], "equal": [], "suffix": []}
+    # Use non-greedy match and lookahead to stop at natural terminators
+    for m in re.finditer(r'不[含包括].{0,2}?(.{1,15}?)(?=的任务|任务|，|,|。|全开|\s|$)', text):
+        val = m.group(1).strip('，,。、 ')
+        if val:
+            result["not_contain"].append(val)
+    for m in re.finditer(r'任务名称?[：:]\s*([^\s，,。\n]+)', text):
+        result["equal"].append(m.group(1))
+    for m in re.finditer(r'(?:任务)?名称?包含[：:\s]*([^\s，,。\n]+)', text):
+        result["contain"].append(m.group(1))
+    return result
+
+
+def _ie_match_tasks(filters: dict, account: Optional[str], tasks: list) -> list:
+    """Filter local task records by name filters and account."""
+    result = tasks
+    if account:
+        result = [t for t in result if t.get("account", "").lower() == account.lower()]
+    for s in filters.get("contain", []):
+        result = [t for t in result if s in t.get("taskName", "")]
+    for s in filters.get("not_contain", []):
+        result = [t for t in result if s not in t.get("taskName", "")]
+    for s in filters.get("equal", []):
+        result = [t for t in result if t.get("taskName", "") == s]
+    return result
+
+
+def _ie_extract_operator(text: str) -> str:
+    """Extract carrier operator type from text."""
+    op_map = {"全网": "ALL", "移动": "YD", "联通": "LT", "电信": "DX",
+              "虚拟": "VIRTUAL", "未知": "UNKNOWN"}
+    for cn, code in op_map.items():
+        if cn in text:
+            return code
+    m = re.search(r'\b(ALL|YD|LT|DX|VIRTUAL|UNKNOWN)\b', text, re.IGNORECASE)
+    return m.group(1).upper() if m else "ALL"
+
+
+_IE_PROVINCES = [
+    "北京", "天津", "上海", "重庆", "河北", "山西", "辽宁", "吉林", "黑龙江",
+    "江苏", "浙江", "安徽", "福建", "江西", "山东", "河南", "湖北", "湖南",
+    "广东", "海南", "四川", "贵州", "云南", "陕西", "甘肃", "青海", "内蒙古",
+    "广西", "西藏", "宁夏", "新疆",
+]
+
+_IE_CITIES = list(dict.fromkeys([  # dict.fromkeys preserves insertion order while deduplicating
+    "广州", "深圳", "北京", "上海", "天津", "重庆", "成都", "杭州", "武汉",
+    "苏州", "南京", "西安", "长沙", "济南", "郑州", "东莞", "沈阳", "青岛",
+    "合肥", "佛山", "宁波", "昆明", "南宁", "哈尔滨", "福州", "厦门", "大连",
+    "太原", "长春", "南昌", "石家庄", "贵阳", "兰州", "银川", "西宁", "拉萨",
+    "乌鲁木齐", "呼和浩特", "海口", "南通", "无锡", "常州", "泉州", "温州",
+    "烟台", "唐山", "保定", "洛阳", "南阳", "泰州", "盐城", "连云港", "淮安",
+    "宿迁", "芜湖", "蚌埠", "淮南", "铜陵", "安庆", "黄山", "绍兴", "台州",
+    "金华", "嘉兴", "徐州", "扬州", "镇江", "湖州", "赣州", "吉安", "上饶",
+    "宜春", "九江", "景德镇", "济宁", "菏泽", "临沂", "潍坊", "威海", "淄博",
+    "枣庄", "泰安", "日照", "平顶山", "安阳", "新乡", "焦作", "许昌", "漯河",
+    "三门峡", "商丘", "周口", "驻马店", "信阳", "开封", "荆州", "宜昌", "十堰",
+    "孝感", "黄冈", "株洲", "湘潭", "衡阳", "邵阳", "岳阳", "常德", "益阳",
+    "郴州", "永州", "珠海", "汕头", "韶关", "惠州", "中山", "江门", "湛江",
+    "茂名", "肇庆", "清远", "潮州", "揭阳", "梅州", "绵阳", "德阳", "宜宾",
+    "自贡", "泸州", "南充", "达州", "遂宁", "内江", "乐山", "广安", "资阳",
+    "广元", "遵义", "安顺", "曲靖", "玉溪", "保山", "昭通", "大理", "丽江",
+    "延安", "宝鸡", "咸阳", "铜川", "渭南", "汉中", "安康", "商洛", "榆林",
+    "天水", "武威", "张掖", "酒泉", "庆阳",
+]))
+
+
+def _ie_extract_locations(text: str) -> tuple:
+    """Return (provinces, cities) lists of location names found in text."""
+    provinces = [p for p in _IE_PROVINCES if p in text]
+    cities = [c for c in _IE_CITIES if c in text]
+    return provinces, cities
+
+
+def _ie_build_task_info_bean(
+    tenant_line_name: Optional[str] = None,
+    tenant_line_id: Optional[int] = None,
+    concurrency: Optional[str] = None,
+    expected_start_time: Optional[str] = None,
+    expected_end_time: Optional[str] = None,
+    expected_connected_count: Optional[str] = None,
+    task_name_filters: Optional[dict] = None,
+) -> dict:
+    """Build a TaskInfoBean dict."""
+    bean: dict = {}
+    if tenant_line_name:
+        bean["tenantLine"] = tenant_line_name
+    if tenant_line_id is not None:
+        bean["tenantLineId"] = tenant_line_id
+    if concurrency:
+        bean["concurrency"] = concurrency
+    if expected_start_time:
+        bean["expectedStartTime"] = expected_start_time
+    if expected_end_time:
+        bean["expectedEndTime"] = expected_end_time
+    if expected_connected_count:
+        bean["expectedConnectedCallCount"] = expected_connected_count
+    if task_name_filters:
+        if task_name_filters.get("contain"):
+            bean["taskNameContainList"] = task_name_filters["contain"]
+        if task_name_filters.get("not_contain"):
+            bean["taskNameNotContainList"] = task_name_filters["not_contain"]
+        if task_name_filters.get("equal"):
+            bean["taskNameEqualList"] = task_name_filters["equal"]
+        if task_name_filters.get("suffix"):
+            bean["taskNameSuffixList"] = task_name_filters["suffix"]
+    return bean
+
+
+def _ie_build_instruction_bean(
+    instruction_type: str,
+    account: Optional[str] = None,
+    task_info_bean_list: Optional[list] = None,
+    extra: Optional[dict] = None,
+) -> dict:
+    """Build an InstructionBean dict mirroring the Java AbstractInstructionBean.
+
+    The instructionId uses UUID hex (no dashes) to match the Java
+    ``UUID.randomUUID().toString().replace("-", "")`` format.
+    """
+    bean: dict = {
+        "instructionId": uuid.uuid4().hex,
+        "instructionType": instruction_type,
+        "account": account or "",
+        "taskInfoBeanList": task_info_bean_list or [],
+    }
+    if extra:
+        bean.update(extra)
+    return bean
+
+
+def _ie_split_segments(text: str) -> list:
+    """
+    Split a multi-operation query into individual segments for line-by-line parsing.
+
+    Handles queries like "白泽加到1000，仙人500，得心6k" where each segment
+    refers to a different line or concurrency setting.
+    """
+    parts = re.split(
+        r'(?<=[0-9])[，,]\s*'  # comma after a digit
+        r'|(?<=[kK千万])[，,]\s*'  # comma after a concurrency unit character
+        r'|(?<=并发)[，,]\s*'   # comma after 并发
+        r'|[；;]\s*'            # semicolons
+        r'|\n+',                # newlines
+        text,
+    )
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _ie_parse_line_segments(text: str, all_lines: list, account: Optional[str]) -> list:
+    """
+    Parse a query that may reference multiple lines/concurrencies into a list
+    of TaskInfoBean dicts, one per distinct segment.
+
+    Data for tenant line matching is read from the local tenant_lines.json file
+    (replacing the original HTTP call to the Baize API).
+    """
+    segments = _ie_split_segments(text)
+    task_name_filters = _ie_extract_task_name_filters(text)
+    task_info_beans: list = []
+
+    for seg in segments:
+        # Match a tenant line referenced in this segment (local file lookup)
+        matched_line = None
+        for ln in all_lines:
+            line_name = ln.get("lineName", "")
+            line_number = ln.get("lineNumber", "")
+            if line_name and (line_name in seg or (line_number and line_number in seg)):
+                matched_line = ln
+                break
+
+        concurrency = _ie_extract_concurrency(seg)
+        expected_end = _ie_extract_expected_end_time(seg)
+        expected_start = _ie_extract_expected_start_time(seg)
+        connected_count = _ie_extract_connected_count(seg)
+
+        if matched_line or concurrency or expected_end or expected_start or connected_count:
+            task_info_beans.append(_ie_build_task_info_bean(
+                tenant_line_name=matched_line.get("lineName") if matched_line else None,
+                tenant_line_id=matched_line.get("id") if matched_line else None,
+                concurrency=concurrency,
+                expected_start_time=expected_start,
+                expected_end_time=expected_end,
+                expected_connected_count=connected_count,
+                task_name_filters=task_name_filters,
+            ))
+
+    # Fallback: try the full text when no individual segments yielded results
+    if not task_info_beans:
+        matched_line = next(
+            (ln for ln in all_lines
+             if ln.get("lineName", "") and ln.get("lineName", "") in text),
+            None,
+        )
+        concurrency = _ie_extract_concurrency(text)
+        expected_end = _ie_extract_expected_end_time(text)
+        expected_start = _ie_extract_expected_start_time(text)
+        connected_count = _ie_extract_connected_count(text)
+
+        task_info_beans.append(_ie_build_task_info_bean(
+            tenant_line_name=matched_line.get("lineName") if matched_line else None,
+            tenant_line_id=matched_line.get("id") if matched_line else None,
+            concurrency=concurrency,
+            expected_start_time=expected_start,
+            expected_end_time=expected_end,
+            expected_connected_count=connected_count,
+            task_name_filters=task_name_filters,
+        ))
+
+    return task_info_beans
+
+
+# ---- Main skill ----
+
+@skill(
+    name="parse_query_to_instructions",
+    description=(
+        "解析自然语言外呼操作指令，返回结构化指令列表（instructionBeanList）。"
+        "通过关键词和正则规则识别操作意图（开始/暂停/恢复任务、调整并发、切换线路、"
+        "屏蔽/放开地区等），并从本地数据文件中匹配线路 ID、任务 ID 等实体，"
+        "输出 JSON 格式的指令列表，供后续执行技能使用。"
+        "注意：查询所需的线路和任务数据从本地文件读取，无需发起 HTTP 请求。"
+    ),
+    parameters={
+        "query": {
+            "type": "string",
+            "description": "用户输入的自然语言外呼操作指令文本",
+        },
+        "account": {
+            "type": "string",
+            "description": "当前操作的主账号名称，用于筛选相关任务数据；不填则不限账号",
+            "required": False,
+        },
+    },
+)
+async def parse_query_to_instructions(
+    ctx: SkillContext,
+    query: str,
+    account: Optional[str] = None,
+) -> str:
+    # Load local data files — replaces HTTP API calls to the Baize platform
+    all_lines: list = _load("tenant_lines.json")
+    all_tasks: list = _load("tasks.json")
+
+    # Detect intent(s) using rule-based matching
+    intents = _ie_detect_intents(query)
+    if not intents:
+        return json.dumps([], ensure_ascii=False)
+
+    # Use account from query text if not explicitly supplied
+    account = account or _ie_extract_account(query)
+
+    instruction_beans: list = []
+    primary_intent = intents[0]
+
+    if primary_intent in ("START_TASK", "RESUME_TASK", "STOP_TASK"):
+        task_info_bean_list = _ie_parse_line_segments(query, all_lines, account)
+        # Resolve task IDs from local tasks.json for each sub-operation
+        for tib in task_info_bean_list:
+            filters = {
+                "contain": tib.get("taskNameContainList", []),
+                "not_contain": tib.get("taskNameNotContainList", []),
+                "equal": tib.get("taskNameEqualList", []),
+                "suffix": tib.get("taskNameSuffixList", []),
+            }
+            matched = _ie_match_tasks(filters, account, all_tasks)
+            if matched:
+                tib["resolvedTaskIds"] = [t["id"] for t in matched]
+        instruction_beans.append(_ie_build_instruction_bean(
+            instruction_type=primary_intent,
+            account=account,
+            task_info_bean_list=task_info_bean_list,
+        ))
+
+    elif primary_intent == "CHANGE_CONCURRENCY":
+        task_info_bean_list = _ie_parse_line_segments(query, all_lines, account)
+        instruction_beans.append(_ie_build_instruction_bean(
+            instruction_type="CHANGE_CONCURRENCY",
+            account=account,
+            task_info_bean_list=task_info_bean_list,
+        ))
+
+    elif primary_intent == "CHANGE_LINE":
+        task_info_bean_list = _ie_parse_line_segments(query, all_lines, account)
+        instruction_beans.append(_ie_build_instruction_bean(
+            instruction_type="CHANGE_LINE",
+            account=account,
+            task_info_bean_list=task_info_bean_list,
+        ))
+
+    elif primary_intent == "FORBID_DISTRICT":
+        provinces, cities = _ie_extract_locations(query)
+        operator = _ie_extract_operator(query)
+        task_name_filters = _ie_extract_task_name_filters(query)
+        matched_tasks = _ie_match_tasks(task_name_filters, account, all_tasks)
+        instruction_beans.append(_ie_build_instruction_bean(
+            instruction_type="FORBID_DISTRICT",
+            account=account,
+            extra={
+                "provinces": provinces,
+                "cities": cities,
+                "operator": operator,
+                "resolvedTaskIds": [t["id"] for t in matched_tasks],
+            },
+        ))
+
+    elif primary_intent == "ALLOW_DISTRICT":
+        provinces, cities = _ie_extract_locations(query)
+        operator = _ie_extract_operator(query)
+        task_name_filters = _ie_extract_task_name_filters(query)
+        matched_tasks = _ie_match_tasks(task_name_filters, account, all_tasks)
+        instruction_beans.append(_ie_build_instruction_bean(
+            instruction_type="ALLOW_DISTRICT",
+            account=account,
+            extra={
+                "provinces": provinces,
+                "cities": cities,
+                "operator": operator,
+                "resolvedTaskIds": [t["id"] for t in matched_tasks],
+            },
+        ))
+
+    return json.dumps(instruction_beans, ensure_ascii=False, indent=2)
